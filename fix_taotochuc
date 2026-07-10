@@ -1,0 +1,46 @@
+sudo bash <<'FIX_ORG_GROUP'
+set -Eeuo pipefail
+
+APP="/home/pvhung/vngoi/app"
+FILE="$APP/judge/utils/organization.py"
+C="$(docker ps --format '{{.Names}}' | grep -E '^vngoi-web-[0-9]+$|vngoi.*web|web.*vngoi' | head -n1)"
+
+test -n "$C" || { echo "[LỖI] Không tìm thấy container web"; exit 1; }
+test -f "$FILE" || { echo "[LỖI] Không tìm thấy $FILE"; exit 1; }
+
+cp "$FILE" "$FILE.bak-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$FILE" <<'PY'
+from pathlib import Path
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text(encoding="utf-8")
+
+old = "g = Group.objects.get(name=settings.GROUP_PERMISSION_FOR_ORG_ADMIN)"
+new = "g, _ = Group.objects.get_or_create(name=settings.GROUP_PERMISSION_FOR_ORG_ADMIN)"
+
+if old in s:
+    s = s.replace(old, new, 1)
+elif new not in s:
+    raise SystemExit("[LỖI] Không tìm thấy dòng Group.objects.get cần sửa")
+
+p.write_text(s, encoding="utf-8")
+print("[OK] Đã sửa organization.py")
+PY
+
+docker exec -w /app "$C" python manage.py shell -c '
+from django.conf import settings
+from django.contrib.auth.models import Group
+g, created = Group.objects.get_or_create(
+    name=settings.GROUP_PERMISSION_FOR_ORG_ADMIN
+)
+print("Nhóm:", g.name, "| vừa tạo:", created)
+'
+
+docker cp "$FILE" "$C:/app/judge/utils/organization.py"
+docker exec "$C" python -m py_compile /app/judge/utils/organization.py
+docker restart "$C" >/dev/null
+
+echo "[HOÀN TẤT] Đã tạo nhóm Org Admin và ngăn lỗi tái diễn."
+FIX_ORG_GROUP

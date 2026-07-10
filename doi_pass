@@ -1,0 +1,1 @@
+docker exec vngoi-web-1 python manage.py shell -c "from django.contrib.auth import get_user_model; U=get_user_model(); u=U.objects.filter(is_superuser=True).first(); assert u, 'Không có tài khoản quản trị'; u.set_password('Admin@123456'); u.is_active=True; u.save(); print('Đã đổi mật khẩu cho tài khoản:', u.username)"

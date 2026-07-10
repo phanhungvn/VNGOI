@@ -1,0 +1,516 @@
+sudo bash <<'SETUP'
+set -Eeuo pipefail
+
+SCRIPT="/home/pvhung/vngoi/apply-customizations.sh"
+
+cat > "$SCRIPT" <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Có thể chạy thủ công bằng:
+# sudo /home/pvhung/vngoi/apply-customizations.sh --force
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+
+ROOT="/home/pvhung/vngoi"
+APP="$ROOT/app"
+DEFAULT_CONTAINER="vngoi-web-1"
+FORCE="${1:-}"
+
+exec 9>/run/lock/vngoi-customize.lock
+flock -n 9 || exit 0
+
+if [ ! -d "$APP" ]; then
+    echo "[BỎ QUA] Không tìm thấy: $APP"
+    exit 0
+fi
+
+C="$DEFAULT_CONTAINER"
+
+if ! docker inspect "$C" >/dev/null 2>&1; then
+    C="$(
+        docker ps --format '{{.Names}}' |
+        grep -E 'vngoi.*web|web.*vngoi' |
+        head -n 1 || true
+    )"
+fi
+
+if [ -z "$C" ] || ! docker inspect "$C" >/dev/null 2>&1; then
+    echo "[BỎ QUA] Chưa tìm thấy container web."
+    exit 0
+fi
+
+if [ "$(docker inspect -f '{{.State.Running}}' "$C" 2>/dev/null)" != "true" ]; then
+    echo "[BỎ QUA] Container $C chưa chạy."
+    exit 0
+fi
+
+# Kiểm tra backend đăng ký một bước có tồn tại hay không.
+if docker exec "$C" python -c \
+    'from registration.backends.simple.views import RegistrationView' \
+    >/dev/null 2>&1; then
+    AUTO_REGISTER_MODE="simple"
+else
+    AUTO_REGISTER_MODE="manual"
+fi
+
+export APP AUTO_REGISTER_MODE
+
+python3 <<'PY'
+from pathlib import Path
+import os
+import re
+import shutil
+
+app = Path(os.environ["APP"])
+auto_mode = os.environ.get("AUTO_REGISTER_MODE", "manual")
+changed_files: list[str] = []
+
+
+def save(rel: str, content: str) -> None:
+    path = app / rel
+
+    if not path.exists():
+        print(f"[CẢNH BÁO] Không tìm thấy {path}")
+        return
+
+    old = path.read_text(encoding="utf-8")
+
+    if old == content:
+        return
+
+    backup = path.with_name(path.name + ".pre-vngoi-custom")
+
+    if not backup.exists():
+        shutil.copy2(path, backup)
+
+    path.write_text(content, encoding="utf-8")
+    changed_files.append(rel)
+
+
+# =========================================================
+# 1. Trang nộp bài: bỏ vùng trắng, đưa Monaco Editor lên trên
+# =========================================================
+rel = "templates/problem/submit.html"
+path = app / rel
+
+if path.exists():
+    s = path.read_text(encoding="utf-8")
+
+    s = re.sub(
+        r'\s*<style id="vngoi-submit-custom">.*?</style>\s*',
+        "\n",
+        s,
+        flags=re.S,
+    )
+
+    submit_css = """
+<style id="vngoi-submit-custom">
+    /* Ẩn textarea gốc nhưng JavaScript vẫn đồng bộ mã nguồn. */
+    #problem_submit #id_source,
+    #problem_submit textarea[name="source"] {
+        display: none !important;
+    }
+
+    /* Không cho loader cao 100vh đẩy trình soạn thảo xuống dưới. */
+    #problem_submit #code-loader {
+        display: none !important;
+    }
+
+    #problem_submit .monaco-editor-container {
+        height: 100vh !important;
+        min-height: 520px;
+    }
+
+    @media (max-width: 767px) {
+        #problem_submit .monaco-editor-container {
+            height: 65vh !important;
+            min-height: 420px;
+        }
+    }
+</style>
+"""
+
+    block_start = s.find("{% block js_media %}")
+    block_end = s.find("{% endblock %}", block_start)
+
+    if block_start != -1 and block_end != -1:
+        s = s[:block_end] + submit_css + "\n" + s[block_end:]
+    else:
+        print("[CẢNH BÁO] Không tìm được block js_media trong submit.html")
+
+    save(rel, s)
+
+
+# =========================================================
+# 2. Base: favicon, footer một dòng và footer cuối trang
+# =========================================================
+rel = "templates/base.html"
+path = app / rel
+
+if path.exists():
+    s = path.read_text(encoding="utf-8")
+
+    favicon = "https://i.ibb.co/ycC7ZMFy/193783156.png?v=193783156"
+
+    # Thay favicon, apple touch icon và android icon.
+    s = re.sub(
+        r'(<link\b[^>]*\brel="(?:apple-touch-icon|icon)"'
+        r'[^>]*\bhref=")[^"]*(")',
+        lambda m: m.group(1) + favicon + m.group(2),
+        s,
+        flags=re.I,
+    )
+
+    # Xóa CSS sticky-footer cũ từng gây che hoặc sai bố cục.
+    s = re.sub(
+        r'\s*<style id="footer-stick-bottom">.*?</style>\s*',
+        "\n",
+        s,
+        flags=re.S,
+    )
+
+    s = re.sub(
+        r'\s*<style id="vngoi-layout-custom">.*?</style>\s*',
+        "\n",
+        s,
+        flags=re.S,
+    )
+
+    layout_css = """
+<style id="vngoi-layout-custom">
+    html,
+    body {
+        min-height: 100%;
+    }
+
+    #page-container {
+        min-height: 100vh;
+    }
+
+    /*
+     * Không sử dụng flex cho page-container vì có thể làm sai
+     * bố cục một số trang. Chỉ tăng chiều cao tối thiểu của main.
+     */
+    main#content {
+        min-height: calc(100vh - 145px) !important;
+    }
+
+    #vngoi-custom-footer {
+        width: 100%;
+        border-radius: 0 !important;
+        padding: 10px 0 !important;
+        margin: 20px 0 0 !important;
+        text-align: center;
+        font-size: 14px;
+    }
+
+    #vngoi-custom-footer .heart.icon {
+        margin-left: 4px;
+    }
+</style>
+"""
+
+    if "</head>" in s:
+        s = s.replace("</head>", layout_css + "\n</head>", 1)
+
+    footer = """
+    <footer id="vngoi-custom-footer"
+            class="ui footer segment inverted">
+        <div class="ui container">
+            Deploy by Phan Hưng <i class="heart red icon"></i>
+
+            <form id="set_language"
+                  action="{{ url('set_language') }}"
+                  method="post"
+                  style="display:none">
+                {% csrf_token %}
+                <input name="next"
+                       type="hidden"
+                       value="{{ request.get_full_path() }}">
+                <input name="language"
+                       type="hidden"
+                       value="{{ LANGUAGE_CODE }}">
+            </form>
+        </div>
+    </footer>"""
+
+    s, count = re.subn(
+        r'\s*<footer\b[^>]*>.*?</footer>',
+        "\n" + footer,
+        s,
+        count=1,
+        flags=re.S | re.I,
+    )
+
+    if count == 0:
+        print("[CẢNH BÁO] Không tìm thấy footer trong base.html")
+
+    save(rel, s)
+
+
+# =========================================================
+# 3. Xóa bục 1st, 2nd, 3rd nhưng giữ bảng xếp hạng bên dưới
+# =========================================================
+rel = "templates/user/list.html"
+path = app / rel
+
+if path.exists():
+    s = path.read_text(encoding="utf-8")
+
+    s = re.sub(
+        r'^\s*\{%\s*include\s+["\']user/top-rank\.html["\']\s*%\}\s*\n?',
+        "",
+        s,
+        flags=re.M,
+    )
+
+    save(rel, s)
+
+
+# =========================================================
+# 4. Sửa URL trang tổ chức: URL chỉ nhận slug
+# =========================================================
+rel = "templates/organization/tabs.html"
+path = app / rel
+
+if path.exists():
+    s = path.read_text(encoding="utf-8")
+    s = s.replace("organization.pk, organization.slug", "organization.slug")
+    save(rel, s)
+
+
+# =========================================================
+# 5. Tắt bình luận và mở đăng ký tài khoản
+# =========================================================
+local_settings = app / "dmoj/local_settings.py"
+main_settings = app / "dmoj/settings.py"
+
+if local_settings.exists():
+    settings_path = local_settings
+elif main_settings.exists():
+    settings_path = main_settings
+else:
+    settings_path = None
+
+if settings_path is not None:
+    rel = str(settings_path.relative_to(app))
+    s = settings_path.read_text(encoding="utf-8")
+
+    settings_values = {
+        "DMOJ_ENABLE_COMMENTS": "False",
+        "REGISTRATION_OPEN": "True",
+    }
+
+    for key, value in settings_values.items():
+        pattern = rf"(?m)^\s*{re.escape(key)}\s*=.*$"
+
+        if re.search(pattern, s):
+            s = re.sub(pattern, f"{key} = {value}", s)
+        else:
+            s += f"\n{key} = {value}\n"
+
+    save(rel, s)
+
+
+# =========================================================
+# 6. Đăng ký xong tự kích hoạt, không gửi email xác thực
+# =========================================================
+rel = "judge/views/register.py"
+path = app / rel
+
+if path.exists():
+    s = path.read_text(encoding="utf-8")
+
+    if auto_mode == "simple":
+        multiline_import = re.compile(
+            r"from registration\.backends\.default\.views import\s*"
+            r"\(\s*ActivationView as OldActivationView\s*,\s*"
+            r"RegistrationView as OldRegistrationView\s*\)",
+            flags=re.S,
+        )
+
+        one_line_import = re.compile(
+            r"from registration\.backends\.default\.views import\s+"
+            r"ActivationView as OldActivationView\s*,\s*"
+            r"RegistrationView as OldRegistrationView"
+        )
+
+        replacement = (
+            "from registration.backends.default.views import "
+            "ActivationView as OldActivationView\n"
+            "from registration.backends.simple.views import "
+            "RegistrationView as OldRegistrationView"
+        )
+
+        if multiline_import.search(s):
+            s = multiline_import.sub(replacement, s, count=1)
+        elif one_line_import.search(s):
+            s = one_line_import.sub(replacement, s, count=1)
+
+        # Nếu trước đây đã dùng cách save thủ công thì đổi lại
+        # sang backend simple để vừa kích hoạt vừa tự đăng nhập.
+        manual_block = re.compile(
+            r"(?m)^(?P<indent>[ \t]*)# AUTO_ACTIVE_NO_EMAIL[^\n]*\n"
+            r"(?P=indent)user = form\.save\(commit=False\)\n"
+            r"(?P=indent)user\.is_active = True\n"
+            r"(?P=indent)user\.save\(\)"
+        )
+
+        s = manual_block.sub(
+            lambda m: (
+                m.group("indent")
+                + "user = super(RegistrationView, self).register(form)"
+            ),
+            s,
+            count=1,
+        )
+
+    else:
+        # Phương án dự phòng nếu image không có backend simple.
+        super_call = (
+            "        user = "
+            "super(RegistrationView, self).register(form)"
+        )
+
+        manual_call = """        # AUTO_ACTIVE_NO_EMAIL
+        user = form.save(commit=False)
+        user.is_active = True
+        user.save()"""
+
+        if (
+            "AUTO_ACTIVE_NO_EMAIL" not in s
+            and super_call in s
+        ):
+            s = s.replace(super_call, manual_call, 1)
+
+    # Tránh lỗi nếu DEFAULT_USER_LANGUAGE không tồn tại.
+    s = s.replace(
+        "Language.objects.get(key=settings.DEFAULT_USER_LANGUAGE)",
+        (
+            "Language.objects.filter("
+            "key=settings.DEFAULT_USER_LANGUAGE"
+            ").first() or Language.get_default_language()"
+        ),
+    )
+
+    save(rel, s)
+
+
+for rel in changed_files:
+    print(f"[ĐÃ SỬA] {rel}")
+PY
+
+SETTINGS_REL=""
+
+if [ -f "$APP/dmoj/local_settings.py" ]; then
+    SETTINGS_REL="dmoj/local_settings.py"
+elif [ -f "$APP/dmoj/settings.py" ]; then
+    SETTINGS_REL="dmoj/settings.py"
+fi
+
+FILES=(
+    "templates/base.html"
+    "templates/problem/submit.html"
+    "templates/user/list.html"
+    "templates/organization/tabs.html"
+    "judge/views/register.py"
+)
+
+if [ -n "$SETTINGS_REL" ]; then
+    FILES+=("$SETTINGS_REL")
+fi
+
+SYNCED=0
+
+for REL in "${FILES[@]}"; do
+    HOST_FILE="$APP/$REL"
+    CONTAINER_FILE="/app/$REL"
+
+    [ -f "$HOST_FILE" ] || continue
+
+    HOST_HASH="$(sha256sum "$HOST_FILE" | awk '{print $1}')"
+
+    CONTAINER_HASH="$(
+        docker exec "$C" sh -c \
+            "sha256sum '$CONTAINER_FILE' 2>/dev/null | awk '{print \$1}'" \
+            2>/dev/null || true
+    )"
+
+    if [ "$HOST_HASH" != "$CONTAINER_HASH" ]; then
+        docker exec "$C" mkdir -p "$(dirname "$CONTAINER_FILE")"
+        docker cp "$HOST_FILE" "$C:$CONTAINER_FILE"
+        echo "[ĐỒNG BỘ] $REL"
+        SYNCED=1
+    fi
+done
+
+if [ "$SYNCED" -eq 1 ] || [ "$FORCE" = "--force" ]; then
+    # Kiểm tra cú pháp trước khi khởi động lại web.
+    docker exec "$C" python -m py_compile \
+        /app/judge/views/register.py
+
+    docker exec -w /app "$C" \
+        python manage.py check
+
+    # Bật công tắc đăng ký trong MiscConfig.
+    docker exec -w /app "$C" python manage.py shell -c \
+        "from judge.models import MiscConfig; m=MiscConfig.objects.order_by('pk').first(); m and setattr(m, 'registration', True); m and m.save(update_fields=['registration']); print('Registration enabled:', bool(m and m.registration))"
+
+    if [ "$SYNCED" -eq 1 ]; then
+        docker restart "$C" >/dev/null
+        echo "[HOÀN TẤT] Đã khởi động lại $C"
+    else
+        echo "[HOÀN TẤT] Cấu hình đã đúng, không cần khởi động lại."
+    fi
+else
+    echo "[OK] Không có thay đổi mới."
+fi
+BASH
+
+chmod 755 "$SCRIPT"
+chown pvhung:pvhung "$SCRIPT"
+
+cat > /etc/systemd/system/vngoi-customize.service <<'SERVICE'
+[Unit]
+Description=Apply VNGOI customizations
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/pvhung/vngoi/apply-customizations.sh
+TimeoutStartSec=180
+SERVICE
+
+cat > /etc/systemd/system/vngoi-customize.timer <<'TIMER'
+[Unit]
+Description=Automatically reapply VNGOI customizations after deployment
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=true
+Unit=vngoi-customize.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+systemctl daemon-reload
+systemctl enable --now vngoi-customize.timer
+
+# Chạy ngay lần đầu.
+"$SCRIPT" --force
+
+echo
+echo "============================================================"
+echo "ĐÃ CÀI TỰ ĐỘNG."
+echo "Sau mỗi lần deploy, hệ thống sẽ tự kiểm tra trong tối đa 2 phút."
+echo "Chạy thủ công: sudo $SCRIPT --force"
+echo "Xem trạng thái: systemctl status vngoi-customize.timer"
+echo "============================================================"
+SETUP

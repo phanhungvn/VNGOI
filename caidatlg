@@ -17,7 +17,7 @@ fi
 
 # Logo cố định được lưu ngoài thư mục source để không mất khi deploy lại.
 cat > "$LOGO_FILE" <<'HTML'
-<img src="https://i.ibb.co/ycC7ZMFy/193783156.png?v=20260710"
+<img src="https://i.ibb.co/QvpzVY9v/fc79a623-597f-42c3-88e3-5a95b50ef4ba.png?v=20260710"
      alt="{{ SITE_LONG_NAME }}"
      style="height:42px; width:auto; max-width:200px; object-fit:contain; display:block;">
 HTML

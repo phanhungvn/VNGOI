@@ -1,0 +1,302 @@
+sudo bash <<'FIX_VNGOI_DATABASE'
+set -Eeuo pipefail
+
+APP="/home/pvhung/vngoi/app"
+AUTO_SCRIPT="/home/pvhung/vngoi/apply-customizations.sh"
+
+# Tự tìm container web.
+C="$(
+    docker ps --format '{{.Names}}' |
+    grep -E '^vngoi-web-[0-9]+$|vngoi.*web|web.*vngoi' |
+    head -n1
+)"
+
+if [ -z "$C" ]; then
+    echo "[LỖI] Không tìm thấy container web đang chạy."
+    exit 1
+fi
+
+echo "[1/5] Container: $C"
+
+# Kiểm tra kết nối Django và database.
+docker exec -w /app "$C" python manage.py check
+
+echo "[2/5] Áp dụng toàn bộ migration còn thiếu..."
+
+docker exec -w /app "$C" \
+    python manage.py migrate --noinput
+
+echo "[3/5] Kiểm tra và sửa các cột boolean cũ đang chặn INSERT..."
+
+docker exec -i -w /app "$C" python manage.py shell <<'PY'
+from datetime import datetime
+
+from django.apps import apps
+from django.db import connection
+
+
+if connection.vendor != "mysql":
+    raise RuntimeError(
+        f"Lệnh sửa này dành cho MySQL/MariaDB, hiện tại là: "
+        f"{connection.vendor}"
+    )
+
+
+quote = connection.ops.quote_name
+existing_tables = set(connection.introspection.table_names())
+
+# Gom model theo tên bảng.
+models_by_table = {}
+
+for model in apps.get_models():
+    opts = model._meta
+
+    if opts.managed and not opts.proxy:
+        models_by_table.setdefault(opts.db_table, model)
+
+
+changed = []
+remaining = []
+
+with connection.cursor() as cursor:
+    for table, model in sorted(models_by_table.items()):
+        if table not in existing_tables:
+            continue
+
+        model_columns = {
+            field.column
+            for field in model._meta.local_concrete_fields
+        }
+
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                EXTRA
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = %s
+            ORDER BY ORDINAL_POSITION
+            """,
+            [table],
+        )
+
+        columns = cursor.fetchall()
+        columns_to_fix = []
+
+        for (
+            column_name,
+            data_type,
+            column_type,
+            nullable,
+            default,
+            extra,
+        ) in columns:
+            is_insert_blocker = (
+                nullable == "NO"
+                and default is None
+                and "auto_increment" not in (extra or "").lower()
+            )
+
+            if not is_insert_blocker:
+                continue
+
+            is_stale = column_name not in model_columns
+
+            # Cột đang gây lỗi cụ thể.
+            is_rate_disqualified = (
+                table == model._meta.db_table
+                and column_name == "rate_disqualified"
+            )
+
+            # Chỉ tự sửa cột kiểu boolean/tinyint cũ để tránh
+            # đặt mặc định sai cho khóa ngoại, chuỗi hoặc ngày giờ.
+            is_boolean_like = (
+                data_type.lower() == "tinyint"
+                and (
+                    column_type.lower().startswith("tinyint(1)")
+                    or column_name.startswith("rate_")
+                    or column_name.startswith("is_")
+                    or column_name.startswith("enable_")
+                    or column_name.startswith("allow_")
+                )
+            )
+
+            if is_rate_disqualified or (is_stale and is_boolean_like):
+                columns_to_fix.append(
+                    (
+                        column_name,
+                        column_type,
+                        is_stale,
+                    )
+                )
+            elif is_stale:
+                remaining.append(
+                    (
+                        table,
+                        column_name,
+                        column_type,
+                    )
+                )
+
+        if not columns_to_fix:
+            continue
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = f"{table}_schema_backup_{timestamp}"
+
+        # MySQL giới hạn tên bảng 64 ký tự.
+        backup = backup[:64]
+
+        print(f"[SAO LƯU] {table} -> {backup}")
+
+        cursor.execute(
+            f"CREATE TABLE {quote(backup)} "
+            f"LIKE {quote(table)}"
+        )
+
+        cursor.execute(
+            f"INSERT INTO {quote(backup)} "
+            f"SELECT * FROM {quote(table)}"
+        )
+
+        for column_name, column_type, is_stale in columns_to_fix:
+            print(
+                f"[SỬA] {table}.{column_name}: "
+                f"DEFAULT 0 "
+                f"(stale={is_stale}, type={column_type})"
+            )
+
+            cursor.execute(
+                f"ALTER TABLE {quote(table)} "
+                f"ALTER COLUMN {quote(column_name)} "
+                f"SET DEFAULT 0"
+            )
+
+            changed.append(
+                f"{table}.{column_name}"
+            )
+
+
+if changed:
+    print("\nCác cột đã sửa:")
+    for item in changed:
+        print("  -", item)
+else:
+    print(
+        "\nKhông còn cột boolean bắt buộc thiếu DEFAULT "
+        "cần sửa."
+    )
+
+
+if remaining:
+    print(
+        "\n[CẢNH BÁO] Các cột cũ khác chưa tự sửa "
+        "vì không phải kiểu boolean:"
+    )
+
+    for table, column, column_type in remaining:
+        print(
+            f"  - {table}.{column} ({column_type})"
+        )
+PY
+
+echo "[4/5] Thêm migrate vào bộ tự động sau mỗi lần deploy..."
+
+if [ -f "$AUTO_SCRIPT" ]; then
+    cp "$AUTO_SCRIPT" \
+       "$AUTO_SCRIPT.bak-db-$(date +%Y%m%d-%H%M%S)"
+
+    python3 - "$AUTO_SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+
+marker = "# AUTO_MIGRATE_DATABASE"
+
+if marker not in text:
+    block = """    # AUTO_MIGRATE_DATABASE
+    echo "[DATABASE] Áp dụng migrations..."
+    docker exec -w /app "$C" python manage.py migrate --noinput
+
+"""
+
+    possible_markers = [
+        "    # Kiểm tra cú pháp trước khi khởi động lại web.\n",
+        "    docker exec \"$C\" python -m py_compile",
+        "    docker exec -w /app \"$C\" \\\n        python manage.py check",
+    ]
+
+    inserted = False
+
+    for target in possible_markers:
+        if target in text:
+            text = text.replace(
+                target,
+                block + target,
+                1,
+            )
+            inserted = True
+            break
+
+    if not inserted:
+        # Chèn trước phần restart nếu cấu trúc script đã thay đổi.
+        target = 'docker restart "$C"'
+
+        if target in text:
+            text = text.replace(
+                target,
+                block + target,
+                1,
+            )
+            inserted = True
+
+    if inserted:
+        path.write_text(text, encoding="utf-8")
+        print("[OK] Đã thêm AUTO_MIGRATE_DATABASE.")
+    else:
+        print(
+            "[CẢNH BÁO] Không xác định được vị trí chèn "
+            "trong apply-customizations.sh."
+        )
+else:
+    print(
+        "[CẢNH BÁO] Chưa tìm thấy apply-customizations.sh; "
+        "phần database hiện tại vẫn đã được sửa."
+    )
+PY
+else
+    echo "[CẢNH BÁO] Không có script tự động: $AUTO_SCRIPT"
+fi
+
+echo "[5/5] Kiểm tra lại và khởi động dịch vụ..."
+
+docker exec -w /app "$C" \
+    python manage.py check
+
+docker restart "$C" >/dev/null
+
+# Celery dùng chung model/database nên khởi động lại nếu có.
+for SERVICE in vngoi-celery-1 vngoi-celery-beat-1; do
+    if docker inspect "$SERVICE" >/dev/null 2>&1; then
+        docker restart "$SERVICE" >/dev/null
+        echo "[RESTART] $SERVICE"
+    fi
+done
+
+echo
+echo "======================================================"
+echo "ĐÃ SỬA DATABASE:"
+echo "- Chạy toàn bộ Django migrations"
+echo "- Sao lưu bảng trước khi ALTER"
+echo "- Sửa rate_disqualified thành DEFAULT 0"
+echo "- Sửa thêm các cột boolean cũ tương tự được phát hiện"
+echo "- Tự chạy migrate sau những lần deploy tiếp theo"
+echo "======================================================"
+FIX_VNGOI_DATABASE

@@ -1,0 +1,89 @@
+sudo bash <<'FIXLOGO'
+set -Eeuo pipefail
+
+ROOT="/home/pvhung/vngoi"
+APP="$ROOT/app"
+SCRIPT="$ROOT/apply-customizations.sh"
+CUSTOM_DIR="/home/pvhung/vngoi-custom"
+LOGO_FILE="$CUSTOM_DIR/site-logo-fragment.html"
+
+mkdir -p "$CUSTOM_DIR"
+
+# Sao lưu logo hiện tại.
+if [ -f "$APP/templates/site-logo-fragment.html" ]; then
+    cp "$APP/templates/site-logo-fragment.html" \
+       "$APP/templates/site-logo-fragment.html.bak-$(date +%Y%m%d-%H%M%S)"
+fi
+
+# Logo cố định được lưu ngoài thư mục source để không mất khi deploy lại.
+cat > "$LOGO_FILE" <<'HTML'
+<img src="https://i.ibb.co/ycC7ZMFy/193783156.png?v=20260710"
+     alt="{{ SITE_LONG_NAME }}"
+     style="height:42px; width:auto; max-width:200px; object-fit:contain; display:block;">
+HTML
+
+install -m 0644 "$LOGO_FILE" "$APP/templates/site-logo-fragment.html"
+
+# Bổ sung logo vào script tự động đã tạo trước đó.
+python3 - "$SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+
+if not path.exists():
+    raise SystemExit(f"Không tìm thấy script: {path}")
+
+s = path.read_text(encoding="utf-8")
+
+source_line = (
+    'VNGOI_CUSTOM_LOGO_SOURCE='
+    '"/home/pvhung/vngoi-custom/site-logo-fragment.html"\n'
+)
+
+if "VNGOI_CUSTOM_LOGO_SOURCE=" not in s:
+    needle = 'APP="$ROOT/app"\n'
+    if needle not in s:
+        raise SystemExit("Không tìm thấy biến APP trong script")
+    s = s.replace(needle, needle + source_line, 1)
+
+copy_block = '''
+# VNGOI_PERSISTENT_HEADER_LOGO
+if [ -f "$VNGOI_CUSTOM_LOGO_SOURCE" ]; then
+    install -m 0644 \
+        "$VNGOI_CUSTOM_LOGO_SOURCE" \
+        "$APP/templates/site-logo-fragment.html"
+fi
+
+'''
+
+if "VNGOI_PERSISTENT_HEADER_LOGO" not in s:
+    needle = 'C="$DEFAULT_CONTAINER"\n'
+    if needle not in s:
+        raise SystemExit("Không tìm thấy vị trí chèn phần logo")
+    s = s.replace(needle, copy_block + needle, 1)
+
+if '"templates/site-logo-fragment.html"' not in s:
+    needle = '''FILES=(
+    "templates/base.html"
+'''
+    replacement = '''FILES=(
+    "templates/base.html"
+    "templates/site-logo-fragment.html"
+'''
+    if needle not in s:
+        raise SystemExit("Không tìm thấy danh sách FILES")
+    s = s.replace(needle, replacement, 1)
+
+path.write_text(s, encoding="utf-8")
+PY
+
+chmod 755 "$SCRIPT"
+
+# Áp dụng ngay và khởi động lại container khi cần.
+"$SCRIPT" --force
+
+echo
+echo "Đã cố định logo mới."
+echo "Hãy nhấn Ctrl + Shift + R hoặc mở lại tab trình duyệt."
+FIXLOGO

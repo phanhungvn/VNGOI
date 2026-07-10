@@ -1,0 +1,66 @@
+cd /home/pvhung/vngoi
+
+sudo python3 - <<'PY'
+from pathlib import Path
+
+# Cấu hình bridge Django
+settings = Path("app/dmoj/local_settings.py")
+text = settings.read_text(encoding="utf-8")
+
+start = "# --- VNGOI BRIDGE START ---"
+end = "# --- VNGOI BRIDGE END ---"
+
+block = """# --- VNGOI BRIDGE START ---
+BRIDGED_JUDGE_ADDRESS = [('0.0.0.0', 9999)]
+BRIDGED_DJANGO_ADDRESS = [('0.0.0.0', 9998)]
+BRIDGED_DJANGO_CONNECT = ('bridge', 9998)
+# --- VNGOI BRIDGE END ---
+"""
+
+if start in text:
+    before = text.split(start, 1)[0].rstrip()
+    after = text.split(end, 1)[1].lstrip() if end in text else ""
+    text = before + "\n\n" + block + "\n" + after
+else:
+    text = text.rstrip() + "\n\n" + block
+
+settings.write_text(text, encoding="utf-8")
+
+# Thêm service bridge vào Docker Compose
+compose = Path("docker-compose.yml")
+yaml = compose.read_text(encoding="utf-8")
+
+bridge = """  bridge:
+    build: ./app
+    restart: unless-stopped
+    command: python manage.py runbridged
+    env_file: .env
+    environment:
+      DJANGO_SETTINGS_MODULE: dmoj.settings
+      DB_HOST: db
+      DB_PORT: 3306
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./data/problems:/vol/problems
+
+"""
+
+if "\n  bridge:\n" not in yaml:
+    marker = "\n  nginx:\n"
+    if marker not in yaml:
+        raise SystemExit("Không tìm thấy service nginx trong docker-compose.yml")
+    yaml = yaml.replace(marker, "\n" + bridge + "  nginx:\n", 1)
+    compose.write_text(yaml, encoding="utf-8")
+
+print("Đã thêm cấu hình bridge.")
+PY
+
+sudo docker compose config >/dev/null &&
+sudo docker compose build web celery bridge &&
+sudo docker compose up -d --force-recreate web celery bridge nginx

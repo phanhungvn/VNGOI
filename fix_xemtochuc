@@ -1,0 +1,152 @@
+sudo bash <<'FIX_ORGANIZATION_URL'
+set -Eeuo pipefail
+
+APP="/home/pvhung/vngoi/app"
+FILE="$APP/templates/organization/tabs.html"
+SCRIPT="/home/pvhung/vngoi/apply-customizations.sh"
+
+C="$(
+    docker ps --format '{{.Names}}' |
+    grep -E '^vngoi-web-[0-9]+$|vngoi.*web|web.*vngoi' |
+    head -n1
+)"
+
+test -n "$C" || {
+    echo "[LỖI] Không tìm thấy container web."
+    exit 1
+}
+
+test -f "$FILE" || {
+    echo "[LỖI] Không tìm thấy $FILE"
+    exit 1
+}
+
+# Tạm dừng bộ tự động để tránh ghi đè trong lúc sửa.
+systemctl stop vngoi-customize.timer 2>/dev/null || true
+systemctl stop vngoi-customize.service 2>/dev/null || true
+
+cp "$FILE" "$FILE.bak-org-url-$(date +%Y%m%d-%H%M%S)"
+
+python3 - "$FILE" "$SCRIPT" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+tabs = Path(sys.argv[1])
+script = Path(sys.argv[2])
+
+# Sửa toàn bộ URL trong organization/tabs.html:
+# organization.id, organization.slug  -> organization.slug
+# organization.pk, organization.slug  -> organization.slug
+text = tabs.read_text(encoding="utf-8")
+
+text, count = re.subn(
+    r"organization\.(?:id|pk)\s*,\s*organization\.slug",
+    "organization.slug",
+    text,
+)
+
+tabs.write_text(text, encoding="utf-8")
+print(f"[ĐÃ SỬA] {count} vị trí trong {tabs}")
+
+# Gắn bản sửa bền vững vào script tự động sau deploy.
+if script.exists():
+    content = script.read_text(encoding="utf-8")
+    marker = "# FIX_ORGANIZATION_TAB_URLS_PERSISTENT"
+
+    block = r'''
+# FIX_ORGANIZATION_TAB_URLS_PERSISTENT
+python3 - <<'PY_FIX_ORG_URLS'
+from pathlib import Path
+import re
+
+p = Path("/home/pvhung/vngoi/app/templates/organization/tabs.html")
+
+if p.exists():
+    s = p.read_text(encoding="utf-8")
+    s = re.sub(
+        r"organization\.(?:id|pk)\s*,\s*organization\.slug",
+        "organization.slug",
+        s,
+    )
+    p.write_text(s, encoding="utf-8")
+PY_FIX_ORG_URLS
+
+'''
+
+    if marker not in content:
+        needle = "FILES=(\n"
+
+        if needle in content:
+            content = content.replace(
+                needle,
+                block + needle,
+                1,
+            )
+        else:
+            content += "\n" + block
+
+        script.write_text(content, encoding="utf-8")
+        print(f"[ĐÃ CẬP NHẬT] {script}")
+    else:
+        print("[OK] Script tự động đã có bản sửa URL tổ chức.")
+else:
+    print(f"[CẢNH BÁO] Không tìm thấy {script}")
+PY
+
+# Không cho tiếp tục nếu file nguồn vẫn còn truyền hai tham số.
+if grep -En \
+    'organization\.(id|pk)[[:space:]]*,[[:space:]]*organization\.slug' \
+    "$FILE"
+then
+    echo "[LỖI] File nguồn vẫn còn URL truyền hai tham số."
+    exit 1
+fi
+
+TARGET="$(
+    docker exec "$C" sh -lc '
+        if [ -f /app/templates/organization/tabs.html ]; then
+            echo /app/templates/organization/tabs.html
+        else
+            find / -type f \
+                -path "*/templates/organization/tabs.html" \
+                2>/dev/null |
+            head -n1
+        fi
+    '
+)"
+
+test -n "$TARGET" || {
+    echo "[LỖI] Không tìm thấy tabs.html trong container."
+    exit 1
+}
+
+echo "[ĐỒNG BỘ] $FILE -> $C:$TARGET"
+docker cp "$FILE" "$C:$TARGET"
+
+# Kiểm tra trực tiếp file trong container.
+if docker exec "$C" grep -En \
+    'organization\.(id|pk)[[:space:]]*,[[:space:]]*organization\.slug' \
+    "$TARGET"
+then
+    echo "[LỖI] File trong container vẫn còn URL sai."
+    exit 1
+fi
+
+echo "[KIỂM TRA] Dòng tạo bài trong tổ chức:"
+docker exec "$C" grep -n \
+    "problem_create_organization" \
+    "$TARGET" || true
+
+docker restart "$C" >/dev/null
+
+# Bật lại hệ thống tự động.
+if [ -f "$SCRIPT" ]; then
+    chmod 755 "$SCRIPT"
+    systemctl enable --now vngoi-customize.timer >/dev/null 2>&1 || true
+fi
+
+echo
+echo "[HOÀN TẤT] URL tổ chức đã được sửa thành chỉ truyền organization.slug."
+echo "Mở lại: /organization/thcsdp"
+FIX_ORGANIZATION_URL

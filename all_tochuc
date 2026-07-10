@@ -1,0 +1,144 @@
+sudo bash <<'FIX_ORG_ACTIVE_FILES'
+set -Eeuo pipefail
+
+APP="/home/pvhung/vngoi/app"
+DIR="$APP/templates/organization"
+SCRIPT="/home/pvhung/vngoi/apply-customizations.sh"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="$APP/template-backups/organization-$STAMP"
+
+C="$(
+    docker ps --format '{{.Names}}' |
+    grep -E '^vngoi-web-[0-9]+$|vngoi.*web|web.*vngoi' |
+    head -n1
+)"
+
+test -n "$C" || {
+    echo "[LỖI] Không tìm thấy container web."
+    exit 1
+}
+
+test -d "$DIR" || {
+    echo "[LỖI] Không tìm thấy $DIR"
+    exit 1
+}
+
+mkdir -p "$BACKUP_DIR"
+
+# Chuyển các file .bak ra khỏi thư mục template để không bị kiểm tra nhầm.
+while IFS= read -r -d '' FILE; do
+    echo "[CHUYỂN BACKUP] $FILE"
+    mv "$FILE" "$BACKUP_DIR/"
+done < <(
+    find "$DIR" -maxdepth 1 -type f \
+        \( -name '*.bak*' -o -name '*~' \) -print0
+)
+
+# Sửa toàn bộ file HTML đang thực sự được sử dụng.
+python3 - "$DIR" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+
+pattern = re.compile(
+    r"organization\.(?:id|pk)\s*,\s*organization\.slug"
+)
+
+total = 0
+
+for path in root.rglob("*.html"):
+    source = path.read_text(encoding="utf-8")
+    fixed, count = pattern.subn("organization.slug", source)
+
+    if count:
+        path.write_text(fixed, encoding="utf-8")
+        total += count
+        print(f"[ĐÃ SỬA] {path}: {count} vị trí")
+
+print(f"[TỔNG] Đã sửa {total} vị trí trong file HTML đang hoạt động.")
+PY
+
+# Chỉ kiểm tra các file có đuôi .html, bỏ qua mọi bản sao lưu.
+if grep -REn --include='*.html' \
+    'organization\.(id|pk)[[:space:]]*,[[:space:]]*organization\.slug' \
+    "$DIR"
+then
+    echo "[LỖI] Vẫn còn URL sai trong file HTML đang hoạt động."
+    exit 1
+fi
+
+# Ghi bản sửa bền vững vào script tự động sau deploy.
+if [ -f "$SCRIPT" ]; then
+    python3 - "$SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+
+marker = "# FIX_ALL_ORGANIZATION_URLS_PERSISTENT"
+
+block = r'''
+# FIX_ALL_ORGANIZATION_URLS_PERSISTENT
+python3 - <<'PY_FIX_ALL_ORG_URLS'
+from pathlib import Path
+import re
+
+root = Path("/home/pvhung/vngoi/app/templates/organization")
+pattern = re.compile(
+    r"organization\.(?:id|pk)\s*,\s*organization\.slug"
+)
+
+if root.exists():
+    for path in root.rglob("*.html"):
+        source = path.read_text(encoding="utf-8")
+        fixed = pattern.sub("organization.slug", source)
+
+        if fixed != source:
+            path.write_text(fixed, encoding="utf-8")
+PY_FIX_ALL_ORG_URLS
+
+'''
+
+if marker not in source:
+    if "FILES=(\n" in source:
+        source = source.replace("FILES=(\n", block + "FILES=(\n", 1)
+    else:
+        source += "\n" + block
+
+    path.write_text(source, encoding="utf-8")
+    print("[ĐÃ CẬP NHẬT] Script tự động sau deploy.")
+else:
+    print("[OK] Script tự động đã có bản sửa tổ chức.")
+PY
+
+    chmod 755 "$SCRIPT"
+fi
+
+# Xóa các file backup thừa trong container rồi chép bản đã sửa.
+docker exec "$C" sh -lc '
+    mkdir -p /app/templates/organization
+    find /app/templates/organization -maxdepth 1 -type f \
+        \( -name "*.bak*" -o -name "*~" \) -delete
+'
+
+docker cp "$DIR/." "$C:/app/templates/organization/"
+
+# Kiểm tra đúng file HTML trong container.
+if docker exec "$C" grep -REn --include='*.html' \
+    'organization\.(id|pk)[[:space:]]*,[[:space:]]*organization\.slug' \
+    /app/templates/organization
+then
+    echo "[LỖI] Container vẫn còn URL sai."
+    exit 1
+fi
+
+docker restart "$C" >/dev/null
+
+echo
+echo "[HOÀN TẤT] Đã sửa và đồng bộ toàn bộ template tổ chức."
+echo "[BACKUP] Các file cũ đã chuyển đến: $BACKUP_DIR"
+echo "Mở lại trang: /organization/ABC"
+FIX_ORG_ACTIVE_FILES

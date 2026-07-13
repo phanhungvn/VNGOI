@@ -1,10 +1,10 @@
 sudo bash <<'FIXLOGO'
 set -Eeuo pipefail
 
-ROOT="/home/pvhung/vngoi"
+ROOT="/home100/vps100/VNGOI/"
 APP="$ROOT/app"
 SCRIPT="$ROOT/apply-customizations.sh"
-CUSTOM_DIR="/home/pvhung/vngoi-custom"
+CUSTOM_DIR="/home100/vps100/vngoi-custom"
 LOGO_FILE="$CUSTOM_DIR/site-logo-fragment.html"
 
 mkdir -p "$CUSTOM_DIR"
@@ -17,7 +17,7 @@ fi
 
 # Logo cố định được lưu ngoài thư mục source để không mất khi deploy lại.
 cat > "$LOGO_FILE" <<'HTML'
-<img src="https://i.ibb.co/QvpzVY9v/fc79a623-597f-42c3-88e3-5a95b50ef4ba.png?v=20260710"
+<img src="https://i.ibb.co/QFKVmYVc/Thi-t-k-ch-a-c-t-n-5.png?v=20260710"
      alt="{{ SITE_LONG_NAME }}"
      style="height:42px; width:auto; max-width:200px; object-fit:contain; display:block;">
 HTML

@@ -8,7 +8,7 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
-ROOT="/home/pvhung/vngoi/"
+ROOT="/home100/vps100/VNGOI"
 APP="$ROOT/app"
 DEFAULT_CONTAINER="vngoi-web-1"
 FORCE="${1:-}"

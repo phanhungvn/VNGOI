@@ -214,7 +214,7 @@ if path.exists():
     <footer id="vngoi-custom-footer"
             class="ui footer segment inverted">
         <div class="ui container">
-            Deploy by Phan Hưng <i class="heart red icon"></i>
+            CNTOJ - THPT Chuyên Nguyễn Trãi <i class="heart red icon"></i>
 
             <form id="set_language"
                   action="{{ url('set_language') }}"
